@@ -1,6 +1,6 @@
 # fix-invalid-json-app
 
-A deterministic MCP task app that repairs malformed JSON-like input into valid JSON when safe and parseable.
+A deterministic MCP task app that repairs malformed JSON-like strings into valid JSON values when safely possible.
 
 ## Deploy on Render
 - **Build Command:** *(leave empty)*
@@ -8,15 +8,14 @@ A deterministic MCP task app that repairs malformed JSON-like input into valid J
 
 ## Public endpoints
 - `GET /health` → `{"status":"ok"}`
-- `GET /privacy` → full privacy policy text (plain text)
-- `GET /terms` → full terms text (plain text)
-- `GET /support` → support contact text including `sidcraigau@gmail.com`
-- `GET /.well-known/openai-apps-challenge` → `OPENAI_APPS_CHALLENGE` or `PLACEHOLDER`
+- `GET /privacy` → `no data stored`
+- `GET /terms` → `Use only with valid input`
+- `GET /support` → support contact including `sidcraigau@gmail.com`
+- `GET /.well-known/openai-apps-challenge` → challenge token or `PLACEHOLDER`
 
 ## MCP endpoint
 - `GET /mcp` for inspection
-- `POST /mcp` supports `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, `ping`
-- Tool description: `Use this tool when JSON input is malformed, contains syntax errors, or cannot be parsed, and needs to be repaired into valid JSON.`
+- `POST /mcp` for JSON-RPC (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`, `ping`)
 
 ## Example tools/call payload
 ```json
@@ -39,7 +38,12 @@ A deterministic MCP task app that repairs malformed JSON-like input into valid J
   "jsonrpc": "2.0",
   "id": 10,
   "result": {
-    "content": [],
+    "content": [
+      {
+        "type": "text",
+        "text": "Fixed invalid JSON"
+      }
+    ],
     "structuredContent": {
       "input": "{'a':1,}",
       "output": {
@@ -50,7 +54,7 @@ A deterministic MCP task app that repairs malformed JSON-like input into valid J
 }
 ```
 
-## Example error response (invalid plain text)
+## Example error response
 ```json
 {
   "jsonrpc": "2.0",

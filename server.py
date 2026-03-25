@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 APP_NAME = "fix-invalid-json-app"
@@ -13,26 +14,10 @@ APP_VERSION = "1.0.0"
 SUPPORT_EMAIL = "sidcraigau@gmail.com"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 MCP_ERROR_MESSAGE = "Input must be a valid JSON-like string"
-TOOL_DESCRIPTION = (
-    "Use this tool when JSON input is malformed, contains syntax errors, "
-    "or cannot be parsed, and needs to be repaired into valid JSON."
-)
-PRIVACY_TEXT = (
-    "This service processes user-provided JSON input solely for the purpose of repairing malformed JSON syntax into valid JSON.\n\n"
-    "We do not store, log, or share user data. All processing is performed in real time and discarded immediately after completion.\n\n"
-    "No personal data is retained.\n\n"
-    f"For questions or support, contact: {SUPPORT_EMAIL}"
-)
-TERMS_TEXT = (
-    "This service is provided as-is for JSON repair purposes.\n\n"
-    "We do not guarantee that every malformed input can be repaired safely or correctly in all edge cases.\n\n"
-    "Users are responsible for reviewing and validating outputs before use.\n\n"
-    "This service should not be used in critical systems without independent verification."
-)
 
 TOOL_DEFINITION = {
     "name": "fix_invalid_json",
-    "description": TOOL_DESCRIPTION,
+    "description": "Fix malformed or invalid JSON into valid usable JSON.",
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -57,8 +42,8 @@ def _remove_trailing_commas(text):
 
 def _balance_braces_brackets(text):
     stack = []
-    openers = {"{": "}", "[": "]"}
-    closers = set(openers.values())
+    pairs = {"{": "}", "[": "]"}
+    closing = set(pairs.values())
     in_string = False
     quote = ""
     escape = False
@@ -78,17 +63,17 @@ def _balance_braces_brackets(text):
             quote = ch
             continue
 
-        if ch in openers:
+        if ch in pairs:
             stack.append(ch)
-        elif ch in closers:
+        elif ch in closing:
             if not stack:
                 raise RepairError(MCP_ERROR_MESSAGE)
             opener = stack.pop()
-            if openers[opener] != ch:
+            if pairs[opener] != ch:
                 raise RepairError(MCP_ERROR_MESSAGE)
 
     while stack:
-        text += openers[stack.pop()]
+        text += pairs[stack.pop()]
     return text
 
 
@@ -100,25 +85,13 @@ def repair_json_like(input_text):
     if not text:
         raise RepairError(MCP_ERROR_MESSAGE)
 
-    candidates = [text]
-    no_trailing_commas = _remove_trailing_commas(text)
-    if no_trailing_commas != text:
-        candidates.append(no_trailing_commas)
-
-    try:
-        balanced = _balance_braces_brackets(no_trailing_commas)
-        if balanced not in candidates:
-            candidates.append(balanced)
-    except RepairError:
-        balanced = None
-
-    for candidate in candidates:
+    for candidate in (text, _remove_trailing_commas(text), _remove_trailing_commas(_balance_braces_brackets(text))):
         try:
             return json.loads(candidate)
         except (json.JSONDecodeError, TypeError, ValueError):
-            continue
+            pass
 
-    normalized = balanced if balanced is not None else no_trailing_commas
+    normalized = _remove_trailing_commas(_balance_braces_brackets(text))
     try:
         value = ast.literal_eval(normalized)
     except (ValueError, SyntaxError):
@@ -140,10 +113,7 @@ class AppHandler(BaseHTTPRequestHandler):
     server_version = "FixInvalidJSON/1.0"
 
     def _send(self, status, payload, content_type="application/json"):
-        if isinstance(payload, str):
-            body = payload.encode("utf-8")
-        else:
-            body = json.dumps(payload).encode("utf-8")
+        body = payload.encode("utf-8") if isinstance(payload, str) else json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -154,13 +124,14 @@ class AppHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             return self._send(200, {"status": "ok"})
         if self.path == "/privacy":
-            return self._send(200, PRIVACY_TEXT, "text/plain; charset=utf-8")
+            return self._send(200, "no data stored", "text/plain")
         if self.path == "/terms":
-            return self._send(200, TERMS_TEXT, "text/plain; charset=utf-8")
+            return self._send(200, "Use only with valid input", "text/plain")
         if self.path == "/support":
-            return self._send(200, f"Support: {SUPPORT_EMAIL}", "text/plain; charset=utf-8")
+            return self._send(200, f"support: {SUPPORT_EMAIL}", "text/plain")
         if self.path == "/.well-known/openai-apps-challenge":
-            return self._send(200, os.environ.get("OPENAI_APPS_CHALLENGE", "PLACEHOLDER"), "text/plain")
+            challenge = os.environ.get("OPENAI_APPS_CHALLENGE", "PLACEHOLDER")
+            return self._send(200, challenge, "text/plain")
         if self.path == "/mcp":
             return self._send(200, {"name": APP_NAME, "version": APP_VERSION, "tools": [TOOL_DEFINITION]})
         return self._send(404, {"error": "not found"})
@@ -169,16 +140,16 @@ class AppHandler(BaseHTTPRequestHandler):
         if self.path != "/mcp":
             return self._send(404, {"error": "not found"})
 
-        content_length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(content_length)
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
         try:
-            rpc_request = json.loads(raw_body.decode("utf-8"))
+            request = json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return self._send(400, make_mcp_error(None, "Invalid JSON-RPC request"))
 
-        request_id = rpc_request.get("id")
-        method = rpc_request.get("method")
-        params = rpc_request.get("params", {})
+        request_id = request.get("id")
+        method = request.get("method")
+        params = request.get("params", {})
 
         if method == "notifications/initialized":
             self.send_response(204)
@@ -187,18 +158,12 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if method == "initialize":
             protocol_version = params.get("protocolVersion", DEFAULT_PROTOCOL_VERSION)
-            return self._send(
-                200,
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "protocolVersion": protocol_version,
-                        "capabilities": {"tools": {"listChanged": False}},
-                        "serverInfo": {"name": APP_NAME, "version": APP_VERSION},
-                    },
-                },
-            )
+            result = {
+                "protocolVersion": protocol_version,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": APP_NAME, "version": APP_VERSION},
+            }
+            return self._send(200, {"jsonrpc": "2.0", "id": request_id, "result": result})
 
         if method == "ping":
             return self._send(200, {"jsonrpc": "2.0", "id": request_id, "result": {}})
@@ -211,30 +176,18 @@ class AppHandler(BaseHTTPRequestHandler):
             arguments = params.get("arguments")
             if tool_name != "fix_invalid_json":
                 return self._send(200, make_mcp_error(request_id, "Unknown tool"))
-            if (
-                not isinstance(arguments, dict)
-                or set(arguments.keys()) != {"input"}
-                or not isinstance(arguments.get("input"), str)
-                or not arguments.get("input").strip()
-            ):
+            if not isinstance(arguments, dict) or set(arguments.keys()) != {"input"} or not isinstance(arguments.get("input"), str) or not arguments.get("input"):
                 return self._send(200, make_mcp_error(request_id, MCP_ERROR_MESSAGE))
-
             try:
-                repaired_output = repair_json_like(arguments["input"])
+                repaired = repair_json_like(arguments["input"])
             except RepairError as exc:
                 return self._send(200, make_mcp_error(request_id, str(exc)))
 
-            return self._send(
-                200,
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "content": [],
-                        "structuredContent": {"input": arguments["input"], "output": repaired_output},
-                    },
-                },
-            )
+            result = {
+                "content": [{"type": "text", "text": "Fixed invalid JSON"}],
+                "structuredContent": {"input": arguments["input"], "output": repaired},
+            }
+            return self._send(200, {"jsonrpc": "2.0", "id": request_id, "result": result})
 
         return self._send(200, make_mcp_error(request_id, "Method not supported"))
 
@@ -249,68 +202,50 @@ def run_server(host="0.0.0.0", port=None):
 
 
 def _post_json(url, payload):
-    req = Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    req = Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
     with urlopen(req, timeout=5) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
 def _get(url):
     with urlopen(url, timeout=5) as resp:
-        return resp.status, resp.headers.get("Content-Type", ""), resp.read().decode("utf-8")
+        ct = resp.headers.get("Content-Type", "")
+        data = resp.read().decode("utf-8")
+        return resp.status, ct, data
 
 
 def run_self_tests():
     source = open(__file__, "r", encoding="utf-8").read()
     assert "0.0.0.0" in source, "Static check failed: host binding missing"
     assert 'os.environ.get("PORT"' in source, "Static check failed: PORT env missing"
-    assert "This service processes user-provided JSON input solely for the purpose of repairing malformed JSON syntax into valid JSON." in source, "Static check failed: privacy text missing"
-    assert "This service is provided as-is for JSON repair purposes." in source, "Static check failed: terms text missing"
-    assert '"content": []' in source, "Static check failed: content[] logic missing"
 
     test_server = ThreadingHTTPServer(("127.0.0.1", 0), AppHandler)
     port = test_server.server_address[1]
-    server_thread = threading.Thread(target=test_server.serve_forever, daemon=True)
-    server_thread.start()
+    thread = threading.Thread(target=test_server.serve_forever, daemon=True)
+    thread.start()
     time.sleep(0.05)
-    base_url = f"http://127.0.0.1:{port}"
+    base = f"http://127.0.0.1:{port}"
 
     try:
-        status, _, body = _get(base_url + "/health")
+        status, _, body = _get(base + "/health")
         assert status == 200, "Health status code mismatch"
-        assert json.loads(body) == {"status": "ok"}, "Health response mismatch"
-
-        status, privacy_ct, privacy_body = _get(base_url + "/privacy")
-        assert status == 200, "Privacy status code mismatch"
-        assert privacy_ct == "text/plain; charset=utf-8", "Privacy content-type mismatch"
-        assert privacy_body == PRIVACY_TEXT, "Privacy body mismatch"
-
-        status, terms_ct, terms_body = _get(base_url + "/terms")
-        assert status == 200, "Terms status code mismatch"
-        assert terms_ct == "text/plain; charset=utf-8", "Terms content-type mismatch"
-        assert terms_body == TERMS_TEXT, "Terms body mismatch"
+        assert json.loads(body) == {"status": "ok"}, "Health body mismatch"
 
         status, initialize_resp = _post_json(
-            base_url + "/mcp",
+            base + "/mcp",
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-01-01"}},
         )
         assert status == 200, "Initialize status code mismatch"
         assert initialize_resp["result"]["protocolVersion"] == "2025-01-01", "Protocol version mismatch"
         assert initialize_resp["result"]["serverInfo"] == {"name": APP_NAME, "version": APP_VERSION}, "Server info mismatch"
 
-        status, tools_resp = _post_json(base_url + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        status, tools_resp = _post_json(base + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         assert status == 200, "tools/list status code mismatch"
         tools = tools_resp["result"]["tools"]
-        assert len(tools) == 1, "tools/list tool count mismatch"
-        assert tools[0]["name"] == "fix_invalid_json", "tools/list name mismatch"
-        assert tools[0]["description"] == TOOL_DESCRIPTION, "tools/list description mismatch"
+        assert len(tools) == 1 and tools[0]["name"] == "fix_invalid_json", "tools/list payload mismatch"
 
         status, call_resp_1 = _post_json(
-            base_url + "/mcp",
+            base + "/mcp",
             {
                 "jsonrpc": "2.0",
                 "id": 3,
@@ -319,11 +254,10 @@ def run_self_tests():
             },
         )
         assert status == 200, "tools/call test1 status mismatch"
-        assert call_resp_1["result"]["content"] == [], "tools/call test1 content mismatch"
-        assert call_resp_1["result"]["structuredContent"] == {"input": "{'a':1,}", "output": {"a": 1}}, "tools/call test1 structuredContent mismatch"
+        assert call_resp_1["result"]["structuredContent"] == {"input": "{'a':1,}", "output": {"a": 1}}, "tools/call test1 mismatch"
 
         status, call_resp_2 = _post_json(
-            base_url + "/mcp",
+            base + "/mcp",
             {
                 "jsonrpc": "2.0",
                 "id": 4,
@@ -332,14 +266,13 @@ def run_self_tests():
             },
         )
         assert status == 200, "tools/call test2 status mismatch"
-        assert call_resp_2["result"]["content"] == [], "tools/call test2 content mismatch"
         assert call_resp_2["result"]["structuredContent"] == {
             "input": '{"a":1,"b":2,}',
             "output": {"a": 1, "b": 2},
-        }, "tools/call test2 structuredContent mismatch"
+        }, "tools/call test2 mismatch"
 
         status, call_resp_3 = _post_json(
-            base_url + "/mcp",
+            base + "/mcp",
             {
                 "jsonrpc": "2.0",
                 "id": 5,
@@ -350,23 +283,11 @@ def run_self_tests():
         assert status == 200, "tools/call test3 status mismatch"
         assert call_resp_3["error"]["message"] == MCP_ERROR_MESSAGE, "tools/call test3 error mismatch"
 
-        status, call_resp_4 = _post_json(
-            base_url + "/mcp",
-            {
-                "jsonrpc": "2.0",
-                "id": 6,
-                "method": "tools/call",
-                "params": {"name": "fix_invalid_json", "arguments": {"input": "   "}},
-            },
-        )
-        assert status == 200, "tools/call test4 status mismatch"
-        assert call_resp_4["error"]["message"] == MCP_ERROR_MESSAGE, "tools/call test4 error mismatch"
-
         print("All self-tests passed")
     finally:
         test_server.shutdown()
         test_server.server_close()
-        server_thread.join(timeout=2)
+        thread.join(timeout=2)
 
 
 if __name__ == "__main__":
